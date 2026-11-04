@@ -1,0 +1,37 @@
+[package]
+name = "ippserver"
+description = "An IPP/2.0 and IPP Everywhere conformant printer service"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+authors = ["Nikita Sychev <root@nsychev.ru>"]
+repository = "https://github.com/nsychev/ippserver-rs"
+keywords = ["ipp", "printing", "printer", "ipp-everywhere"]
+categories = ["network-programming", "hardware-support"]
+
+[features]
+default = []
+# DNS-SD advertising with a built-in mDNS responder. Conflicts with Avahi/Bonjour.
+mdns-sd = ["dep:mdns-sd"]
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+flate2 = "1"
+http = "1"
+# `default-features = false` drops the IPP *client*, which brings in reqwest;
+# this crate is the server. `chrono` is what gives `IppDateTime` its
+# conversion from a `chrono` timestamp, used for the dateTime attributes.
+ipp = { version = "8", default-features = false, features = ["chrono"] }
+mdns-sd = { version = "0.21", optional = true }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "v5"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "macros", "fs"] }
