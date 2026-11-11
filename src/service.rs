@@ -10,12 +10,14 @@ use ipp::parser::IppParser;
 use ipp::request::IppRequestResponse;
 use ipp::value::IppValue;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::time::Instant;
 
 pub use bytes::Bytes;
 
 use crate::attributes::{self, JOB_CREATION_ATTRIBUTES, PrinterContext};
 use crate::job::{Clock, CreateError, Job, Moment, WHICH_JOBS};
-use crate::{Backend, ConfigError, JobRequest, Operations, PrinterConfig, Rejection};
+use crate::{Backend, ConfigError, JobRequest, Operations, Outcome, PrinterConfig, Rejection};
 
 /// IPP's out-of-band `unsupported` value tag, used in the Unsupported
 /// Attributes group.
@@ -887,64 +889,168 @@ impl<B: Backend> Printer<B> {
     }
 }
 
+struct Queued<P> {
+    submission: Submission<P>,
+    ready: Instant,
+    attempts: u32,
+}
+
+impl<P> Queued<P> {
+    /// A job that has just arrived and may go at once.
+    fn fresh(submission: Submission<P>) -> Self {
+        Queued {
+            submission,
+            ready: Instant::now(),
+            attempts: 0,
+        }
+    }
+}
+
 /// Prints queued jobs, one at a time.
+///
+/// Deferred jobs are deprioritized comparing to newer ones.
 async fn worker<B: Backend>(
     printer: Arc<Printer<B>>,
     mut queue: mpsc::UnboundedReceiver<Submission<B::Plan>>,
 ) {
-    while let Some(submission) = queue.recv().await {
-        let id = submission.request.id;
+    let mut deferred: Vec<Queued<B::Plan>> = Vec::new();
 
-        let Some(job) = printer.jobs.get(id) else {
-            continue;
-        };
-        if job.cancel_requested || job.is_finished() {
-            printer.jobs.update(id, |j| {
-                if j.is_active() {
-                    j.finish(
-                        &printer.clock,
-                        JobState::Canceled,
-                        "job-canceled-by-user",
-                        "canceled before printing",
-                    );
-                }
-            });
-            continue;
+    while let Some(queued) = next(&mut queue, &mut deferred).await {
+        if let Some(again) = attempt(&printer, queued).await {
+            deferred.push(again);
+        }
+    }
+}
+
+/// Poll for the next job to offer.
+///
+/// Returns `None` once no Client can submit again and nothing is deferred.
+async fn next<P>(
+    queue: &mut mpsc::UnboundedReceiver<Submission<P>>,
+    deferred: &mut Vec<Queued<P>>,
+) -> Option<Queued<P>> {
+    let mut closed = false;
+
+    loop {
+        if !closed {
+            match queue.try_recv() {
+                Ok(submission) => return Some(Queued::fresh(submission)),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => closed = true,
+            }
         }
 
-        printer.jobs.update(id, |j| {
-            j.state = JobState::Processing;
-            j.reasons = vec!["job-printing".into()];
-            j.processing = Some(Moment::now(&printer.clock));
-        });
-
-        match printer
-            .backend
-            .print(submission.request, submission.plan)
-            .await
+        // No newer jobs, try deferred ones.
+        let now = Instant::now();
+        if let Some(index) = deferred
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| job.ready <= now)
+            .min_by_key(|(_, job)| job.ready)
+            .map(|(index, _)| index)
         {
-            Ok(()) => {
-                printer.jobs.update(id, |j| {
-                    j.finish(
-                        &printer.clock,
-                        JobState::Completed,
-                        "job-completed-successfully",
-                        "",
-                    )
-                });
-                tracing::info!(job = id, "printed");
+            return Some(deferred.remove(index));
+        }
+
+        match deferred.iter().map(|job| job.ready).min() {
+            // Wait for the first deferred job's turn, unless work arrives.
+            Some(turn) if !closed => {
+                tokio::select! {
+                    biased;
+                    received = queue.recv() => match received {
+                        Some(submission) => return Some(Queued::fresh(submission)),
+                        None => closed = true,
+                    },
+                    _ = tokio::time::sleep_until(turn) => {}
+                }
             }
-            Err(error) => {
-                tracing::error!(job = id, %error, "job failed");
-                printer.jobs.update(id, |j| {
-                    j.finish(
-                        &printer.clock,
-                        JobState::Aborted,
-                        "job-aborted-by-system",
-                        &error,
-                    )
-                });
+            Some(turn) => tokio::time::sleep_until(turn).await,
+            None if closed => return None,
+            None => match queue.recv().await {
+                Some(submission) => return Some(Queued::fresh(submission)),
+                None => closed = true,
+            },
+        }
+    }
+}
+
+/// Offers one job to the backend, returning it if it should be offered again.
+async fn attempt<B: Backend>(
+    printer: &Arc<Printer<B>>,
+    mut queued: Queued<B::Plan>,
+) -> Option<Queued<B::Plan>> {
+    let id = queued.submission.request.id;
+
+    let job = printer.jobs.get(id)?;
+    if job.cancel_requested || job.is_finished() {
+        printer.jobs.update(id, |j| {
+            if j.is_active() {
+                j.finish(
+                    &printer.clock,
+                    JobState::Canceled,
+                    "job-canceled-by-user",
+                    "canceled before printing",
+                );
             }
+        });
+        return None;
+    }
+
+    printer.jobs.update(id, |j| {
+        j.state = JobState::Processing;
+        j.reasons = vec!["job-printing".into()];
+        j.processing = Some(Moment::now(&printer.clock));
+    });
+
+    queued.attempts += 1;
+    match printer
+        .backend
+        .print(
+            &queued.submission.request,
+            &queued.submission.plan,
+            queued.attempts,
+        )
+        .await
+    {
+        Outcome::Printed => {
+            printer.jobs.update(id, |j| {
+                j.finish(
+                    &printer.clock,
+                    JobState::Completed,
+                    "job-completed-successfully",
+                    "",
+                )
+            });
+            tracing::info!(job = id, "printed");
+            None
+        }
+        Outcome::Failed(error) => {
+            tracing::error!(job = id, %error, "job failed");
+            printer.jobs.update(id, |j| {
+                j.finish(
+                    &printer.clock,
+                    JobState::Aborted,
+                    "job-aborted-by-system",
+                    &error,
+                )
+            });
+            None
+        }
+        Outcome::Deferred { reason, after } => {
+            tracing::warn!(
+                job = id,
+                attempt = queued.attempts,
+                %reason,
+                "deferred, will try again in {after:?}"
+            );
+            printer.jobs.update(id, |j| {
+                j.state = JobState::Pending;
+                j.reasons = vec!["resources-are-not-ready".into()];
+                j.message = reason.clone();
+                j.processing = None;
+            });
+            queued.ready = Instant::now() + after;
+            Some(queued)
         }
     }
 }
@@ -1148,7 +1254,196 @@ fn decompress_deflate(raw: &[u8]) -> std::io::Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use super::*;
+    use crate::test_support::test_config;
+    use crate::{Accepted, Rejection};
+
+    /// A backend that answers with the outcomes it was given, in order, and
+    /// records which job it was offered on which attempt.
+    struct Scripted {
+        outcomes: Mutex<VecDeque<Outcome>>,
+        offers: Mutex<Vec<(i32, u32)>>,
+    }
+
+    impl Scripted {
+        fn new(outcomes: Vec<Outcome>) -> Arc<Self> {
+            Arc::new(Scripted {
+                outcomes: Mutex::new(outcomes.into()),
+                offers: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn offers(&self) -> Vec<(i32, u32)> {
+            self.offers.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for Arc<Scripted> {
+        type Plan = ();
+
+        async fn validate(&self, _: &JobRequest) -> Result<Accepted<()>, Rejection> {
+            Ok(Accepted {
+                impressions: 1,
+                format: None,
+                plan: (),
+            })
+        }
+
+        async fn print(&self, request: &JobRequest, _: &(), attempt: u32) -> Outcome {
+            self.offers.lock().unwrap().push((request.id, attempt));
+            self.outcomes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Outcome::Printed)
+        }
+    }
+
+    fn deferred(after: Duration) -> Outcome {
+        Outcome::Deferred {
+            reason: "out of paper".into(),
+            after,
+        }
+    }
+
+    /// Starts a Printer whose backend answers with `outcomes`.
+    fn printer_with(outcomes: Vec<Outcome>) -> (Arc<Printer<Arc<Scripted>>>, Arc<Scripted>) {
+        let backend = Scripted::new(outcomes);
+        let printer = Printer::start(test_config(), Arc::clone(&backend)).unwrap();
+        (printer, backend)
+    }
+
+    /// Queues a job, as `accept_document` does once a document has arrived.
+    fn submit<B: Backend<Plan = ()>>(printer: &Arc<Printer<B>>) -> i32 {
+        let job = printer
+            .jobs
+            .create(
+                &printer.clock,
+                std::net::Ipv4Addr::new(10, 0, 0, 1).into(),
+                "tester".into(),
+                "a job".into(),
+                "application/pdf".into(),
+                Vec::new(),
+            )
+            .expect("the store should take the job");
+        printer.jobs.update(job.id, |j| j.has_document = true);
+
+        let request = printer.job_request(&job, b"%PDF-1.7".to_vec());
+        printer
+            .queue
+            .send(Submission { request, plan: () })
+            .expect("the worker should be running");
+        job.id
+    }
+
+    /// Lets the worker run until it is waiting on something.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_job_is_offered_again_and_prints() {
+        let (printer, backend) = printer_with(vec![deferred(Duration::from_secs(30))]);
+        let id = submit(&printer);
+
+        settle().await;
+        // Still the Printer's job, not a failure: a Client sees it waiting.
+        let job = printer.jobs.get(id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.reasons, vec!["resources-are-not-ready".to_string()]);
+        assert_eq!(job.message, "out of paper");
+        assert!(job.is_active(), "a deferred job must still count as queued");
+
+        // Once the wait is over it goes again, and the backend is told which
+        // attempt this is.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(printer.jobs.get(id).unwrap().state, JobState::Completed);
+        assert_eq!(backend.offers(), vec![(id, 1), (id, 2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_job_that_arrives_later_does_not_wait_behind_a_deferred_one() {
+        // The first job is deferred for a minute; the second must not sit
+        // behind it for that minute.
+        let (printer, backend) = printer_with(vec![deferred(Duration::from_secs(60))]);
+        let first = submit(&printer);
+        let second = submit(&printer);
+
+        settle().await;
+        assert_eq!(
+            printer.jobs.get(second).unwrap().state,
+            JobState::Completed,
+            "the newer job should have gone straight through"
+        );
+        assert_eq!(printer.jobs.get(first).unwrap().state, JobState::Pending);
+        assert_eq!(backend.offers(), vec![(first, 1), (second, 1)]);
+
+        // The deferred one follows once its turn comes and the queue is quiet.
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        settle().await;
+        assert_eq!(printer.jobs.get(first).unwrap().state, JobState::Completed);
+        assert_eq!(backend.offers(), vec![(first, 1), (second, 1), (first, 2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_job_can_be_cancelled_while_it_waits() {
+        let (printer, backend) = printer_with(vec![deferred(Duration::from_secs(30))]);
+        let id = submit(&printer);
+        settle().await;
+
+        printer.cancel(id);
+        assert_eq!(printer.jobs.get(id).unwrap().state, JobState::Canceled);
+
+        // Its turn comes and goes without the document being printed.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(printer.jobs.get(id).unwrap().state, JobState::Canceled);
+        assert_eq!(backend.offers(), vec![(id, 1)], "it printed after cancel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_backend_that_gives_up_aborts_the_job() {
+        let (printer, backend) = printer_with(vec![
+            deferred(Duration::from_secs(5)),
+            Outcome::Failed("the printer is still out of paper".into()),
+        ]);
+        let id = submit(&printer);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        settle().await;
+
+        let job = printer.jobs.get(id).unwrap();
+        assert_eq!(job.state, JobState::Aborted);
+        assert_eq!(job.message, "the printer is still out of paper");
+        assert_eq!(backend.offers(), vec![(id, 1), (id, 2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferring_does_not_lose_the_job_while_others_are_printed() {
+        // One sick job, a stream of healthy ones: the sick one is still
+        // there at the end, and the healthy ones were not held up.
+        let (printer, backend) = printer_with(vec![deferred(Duration::from_secs(45))]);
+        let sick = submit(&printer);
+        settle().await;
+
+        let healthy: Vec<i32> = (0..3).map(|_| submit(&printer)).collect();
+        settle().await;
+        for id in &healthy {
+            assert_eq!(printer.jobs.get(*id).unwrap().state, JobState::Completed);
+        }
+        assert_eq!(printer.jobs.get(sick).unwrap().state, JobState::Pending);
+
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(printer.jobs.get(sick).unwrap().state, JobState::Completed);
+        assert_eq!(backend.offers().last(), Some(&(sick, 2)));
+    }
 
     #[test]
     fn versions_outside_the_supported_set_are_rejected() {

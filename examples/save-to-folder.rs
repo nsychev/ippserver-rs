@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use ippserver::{Accepted, Backend, JobRequest, Printer, PrinterConfig, Rejection, serve};
+use ippserver::{Accepted, Backend, JobRequest, Outcome, Printer, PrinterConfig, Rejection, serve};
 use uuid::Uuid;
 
 struct Folder {
@@ -46,10 +46,10 @@ impl Backend for Folder {
         })
     }
 
-    async fn print(&self, job: JobRequest, file: PathBuf) -> Result<(), String> {
-        tokio::fs::write(&file, &job.document)
-            .await
-            .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
+    async fn print(&self, job: &JobRequest, file: &PathBuf, _attempt: u32) -> Outcome {
+        if let Err(error) = tokio::fs::write(file, &job.document).await {
+            return Outcome::Failed(format!("cannot write {}: {error}", file.display()));
+        }
 
         println!(
             "job {} from {} ({}): {} bytes -> {}",
@@ -59,7 +59,7 @@ impl Backend for Folder {
             job.document.len(),
             file.display()
         );
-        Ok(())
+        Outcome::Printed
     }
 }
 

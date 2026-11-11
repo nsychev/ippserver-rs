@@ -12,7 +12,7 @@ systems can connect to the service out of the box.
 Implement `Backend`. It has two methods `validate` and `print`:
 
 ```rust
-use ippserver::{Accepted, Backend, JobRequest, Rejection};
+use ippserver::{Accepted, Backend, JobRequest, Outcome, Rejection};
 
 struct MyPrinter;
 
@@ -27,12 +27,25 @@ impl Backend for MyPrinter {
     }
 
     /// Asynchronous part, runs on worker when the job is already queued.
-    async fn print(&self, job: JobRequest, _plan: ()) -> Result<(), String> {
+    async fn print(&self, job: &JobRequest, _plan: &(), _attempt: u32) -> Outcome {
         println!("printing {} bytes", job.document.len());
-        Ok(())
+        Outcome::Printed
     }
 }
 ```
+some state
+`plan` argument in `print` is a value that `validate` returned. It can be used
+for transferring some state between the steps.
+
+Possible outcomes:
+- `Outcome::Printed` — job was completed successfully
+- `Outcome::Failed` — job was failed
+- `Outcome::Deferred { reason, after }` — job can not be completed right now,
+   but queue will offer it again in `after`
+
+`attempt` argument contains number of previous attempts of the same job that
+were finished with `Outcome::Deferred`. You can use it to reject jobs that were
+retried too many times.
 
 Then serve it:
 

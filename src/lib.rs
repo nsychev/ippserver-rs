@@ -6,7 +6,7 @@
 //! Implement `Backend`. It has two methods `validate` and `print`:
 //!
 //! ```rust
-//! use ippserver::{Accepted, Backend, JobRequest, Rejection};
+//! use ippserver::{Accepted, Backend, JobRequest, Outcome, Rejection};
 //!
 //! struct MyPrinter;
 //!
@@ -21,9 +21,9 @@
 //!     }
 //!
 //!     /// Asynchronous part, runs on worker when the job is already queued.
-//!     async fn print(&self, job: JobRequest, _plan: ()) -> Result<(), String> {
+//!     async fn print(&self, job: &JobRequest, _plan: &(), _attempt: u32) -> Outcome {
 //!         println!("printing {} bytes", job.document.len());
-//!         Ok(())
+//!         Outcome::Printed
 //!     }
 //! }
 //! ```
@@ -64,6 +64,7 @@ pub use ipp::model::{JobState, PrinterState, StatusCode};
 pub use service::{Printer, RequestContext};
 
 use std::net::IpAddr;
+use std::time::Duration;
 
 use ipp::attribute::IppAttribute;
 use ipp::value::IppValue;
@@ -467,6 +468,31 @@ pub struct Accepted<P> {
     pub plan: P,
 }
 
+/// How an attempt at printing a job ended.
+#[derive(Debug, Clone)]
+pub enum Outcome {
+    /// The document is on paper. The job is completed.
+    Printed,
+    /// Not now, but perhaps shortly.
+    ///
+    /// The job stays `pending`, with a `job-state-reasons` of
+    /// `resources-are-not-ready`, and is offered again once `after` has
+    /// passed and nothing newer is waiting. Jobs submitted since go first,
+    /// so one printer that is out of paper does not hold up the queue.
+    ///
+    /// The Printer does not limit how often a job may be deferred: the
+    /// backend is told which attempt it is on and decides when to give up.
+    Deferred {
+        /// What to tell whoever asks after the job, such as `out of paper`.
+        reason: String,
+        /// The soonest the job should be offered again.
+        after: Duration,
+    },
+    /// The job will never print. It is aborted, with `error` recorded as
+    /// `job-state-message`.
+    Failed(String),
+}
+
 /// What the Printer does with a job.
 #[async_trait::async_trait]
 pub trait Backend: Send + Sync + 'static {
@@ -482,9 +508,13 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Prints an accepted job on the worker.
     ///
-    /// An error here aborts the job. It is recorded but there is no guarantee
-    /// the Client will receive it.
-    async fn print(&self, request: JobRequest, plan: Self::Plan) -> Result<(), String>;
+    /// `attempt` counts from one and rises each time the job is offered
+    /// again after [`Outcome::Deferred`], so a backend can give up on a
+    /// printer that stays unavailable.
+    ///
+    /// The request and the plan are borrowed because the Printer keeps them:
+    /// a deferred job is offered again from the same pair.
+    async fn print(&self, request: &JobRequest, plan: &Self::Plan, attempt: u32) -> Outcome;
 
     /// Handles `Identify-Printer`.
     ///
