@@ -61,7 +61,7 @@ mod test_support;
 
 pub use http::{router, serve};
 pub use ipp::model::{JobState, PrinterState, StatusCode};
-pub use service::{Printer, RequestContext};
+pub use service::{Exchange, IppSummary, Printer, RequestContext};
 
 use std::net::IpAddr;
 use std::time::Duration;

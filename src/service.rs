@@ -36,6 +36,54 @@ pub struct RequestContext {
     pub host: String,
 }
 
+/// Request metadata for access logs.
+#[derive(Debug, Clone, Default)]
+pub struct IppSummary {
+    pub operation: Option<u16>,
+    pub request_id: Option<i32>,
+    pub status: Option<StatusCode>,
+    pub job_id: Option<i32>,
+    pub job_name: Option<String>,
+    pub document_format: Option<String>,
+    pub user: Option<String>,
+}
+
+impl IppSummary {
+    /// The IPP name of the operation, like `Print-Job`, if it is one of the
+    /// operations IPP defines.
+    pub fn operation_name(&self) -> Option<String> {
+        use ipp::prelude::*;
+
+        Operation::from_u16(self.operation?).map(|known| hyphenate(&format!("{known:?}")))
+    }
+
+    /// The IPP keyword for the status, like `successful-ok`.
+    pub fn status_name(&self) -> Option<String> {
+        Some(hyphenate(&format!("{:?}", self.status?)).to_ascii_lowercase())
+    }
+
+    fn describe(&mut self, operation: u16, request: &IppRequestResponse) {
+        self.operation = Some(operation);
+        self.job_id = requested_job_id(request);
+        self.job_name = name_or_text(operation_attribute(request, IppAttribute::JOB_NAME))
+            .or_else(|| name_or_text(operation_attribute(request, IppAttribute::DOCUMENT_NAME)))
+            .map(sanitise);
+        self.user = name_or_text(operation_attribute(
+            request,
+            IppAttribute::REQUESTING_USER_NAME,
+        ))
+        .map(sanitise);
+        self.document_format = declared_format(request);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Exchange {
+    /// The encoded IPP response.
+    pub response: Vec<u8>,
+    pub summary: IppSummary,
+}
+
 /// A job waiting for the worker.
 struct Submission<P> {
     request: JobRequest,
@@ -106,66 +154,80 @@ impl<B: Backend> Printer<B> {
         }
     }
 
-    /// Handles one IPP request, returning the encoded response.
-    pub async fn handle(&self, body: Bytes, ctx: &RequestContext) -> Vec<u8> {
+    /// Handles one IPP request, returning the encoded response and metadata.
+    pub async fn handle(&self, body: Bytes, ctx: &RequestContext) -> Exchange {
+        let mut summary = IppSummary::default();
+        let response = self.respond_to(body, ctx, &mut summary).await;
+
+        summary.status = Some(response.header().status_code());
+        if summary.job_id.is_none()
+            && matches!(
+                summary.operation,
+                Some(Operations::PRINT_JOB | Operations::CREATE_JOB)
+            )
+        {
+            summary.job_id = created_job_id(&response);
+        }
+
+        Exchange {
+            response: response.to_bytes().to_vec(),
+            summary,
+        }
+    }
+
+    async fn respond_to(
+        &self,
+        body: Bytes,
+        ctx: &RequestContext,
+        summary: &mut IppSummary,
+    ) -> IppRequestResponse {
         let request_id = body
             .get(4..8)
-            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-            .unwrap_or(0);
+            .map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+        summary.request_id = request_id;
+        let request_id = request_id.unwrap_or(0);
 
         // RFC 8011 section 4.1.8: an unsupported version is refused before
         // anything else is looked at.
         let Some(version) = supported_version(&body) else {
-            return self
-                .error(
-                    IppVersion::v2_0(),
-                    request_id,
-                    StatusCode::ServerErrorVersionNotSupported,
-                    "this printer speaks IPP 1.0, 1.1 and 2.0",
-                )
-                .to_bytes()
-                .to_vec();
+            return self.error(
+                IppVersion::v2_0(),
+                request_id,
+                StatusCode::ServerErrorVersionNotSupported,
+                "this printer speaks IPP 1.0, 1.1 and 2.0",
+            );
         };
 
         // RFC 8011 section 4.1.1: zero is not a request id.
         if request_id == 0 {
-            return self
-                .error(
-                    version,
-                    request_id,
-                    StatusCode::ClientErrorBadRequest,
-                    "request-id must not be 0",
-                )
-                .to_bytes()
-                .to_vec();
+            return self.error(
+                version,
+                request_id,
+                StatusCode::ClientErrorBadRequest,
+                "request-id must not be 0",
+            );
         }
 
         // RFC 8011 section 4.1.4: the first two operation attributes are
         // attributes-charset then attributes-natural-language, in that order.
         if !has_required_preamble(&body) {
-            return self
-                .error(
-                    version,
-                    request_id,
-                    StatusCode::ClientErrorBadRequest,
-                    "attributes-charset and attributes-natural-language must come first",
-                )
-                .to_bytes()
-                .to_vec();
+            return self.error(
+                version,
+                request_id,
+                StatusCode::ClientErrorBadRequest,
+                "attributes-charset and attributes-natural-language must come first",
+            );
         }
 
         let request = match IppParser::new(Cursor::new(body.clone())).parse() {
             Ok(request) => request,
             Err(error) => {
-                return self
-                    .error(
-                        version,
-                        request_id,
-                        StatusCode::ClientErrorBadRequest,
-                        format!("malformed request: {error}"),
-                    )
-                    .to_bytes()
-                    .to_vec();
+                return self.error(
+                    version,
+                    request_id,
+                    StatusCode::ClientErrorBadRequest,
+                    format!("malformed request: {error}"),
+                );
             }
         };
 
@@ -173,25 +235,21 @@ impl<B: Backend> Printer<B> {
             && let IppValue::Charset(charset) = charset
             && !charset.eq_ignore_ascii_case("utf-8")
         {
-            return self
-                .error(
-                    version,
-                    request_id,
-                    StatusCode::ClientErrorCharsetNotSupported,
-                    "only utf-8 is supported",
-                )
-                .to_bytes()
-                .to_vec();
+            return self.error(
+                version,
+                request_id,
+                StatusCode::ClientErrorCharsetNotSupported,
+                "only utf-8 is supported",
+            );
         }
 
         // `operation_or_status` is the one signed 16-bit header field IPP
         // uses for an operation id in a request and a status code in a
         // response.
         let operation = request.header().operation_or_status as u16;
-        let response = self
-            .dispatch(operation, request, version, request_id, ctx)
-            .await;
-        response.to_bytes().to_vec()
+        summary.describe(operation, &request);
+        self.dispatch(operation, request, version, request_id, ctx)
+            .await
     }
 
     async fn dispatch(
@@ -768,19 +826,12 @@ impl<B: Backend> Printer<B> {
     }
 
     fn job_id(&self, request: &IppRequestResponse) -> Result<i32, Rejection> {
-        if let Some(IppValue::Integer(id)) = operation_attribute(request, IppAttribute::JOB_ID) {
-            return Ok(*id);
-        }
-        // A job-uri ends in the job id.
-        if let Some(IppValue::Uri(uri)) = operation_attribute(request, IppAttribute::JOB_URI)
-            && let Some(id) = uri.rsplit('/').next().and_then(|s| s.parse().ok())
-        {
-            return Ok(id);
-        }
-        Err(Rejection::new(
-            StatusCode::ClientErrorBadRequest,
-            "job-id or job-uri is required",
-        ))
+        requested_job_id(request).ok_or_else(|| {
+            Rejection::new(
+                StatusCode::ClientErrorBadRequest,
+                "job-id or job-uri is required",
+            )
+        })
     }
 
     fn check_document_format(&self, request: &IppRequestResponse) -> Result<(), Rejection> {
@@ -1111,6 +1162,54 @@ fn operation_attribute<'a>(request: &'a IppRequestResponse, name: &str) -> Optio
         .next()?
         .get(name)
         .map(IppAttribute::value)
+}
+
+/// The job a request names, by `job-id` or by `job-uri`.
+fn requested_job_id(request: &IppRequestResponse) -> Option<i32> {
+    if let Some(IppValue::Integer(id)) = operation_attribute(request, IppAttribute::JOB_ID) {
+        return Some(*id);
+    }
+    // A job-uri ends in the job id.
+    if let Some(IppValue::Uri(uri)) = operation_attribute(request, IppAttribute::JOB_URI) {
+        return uri.rsplit('/').next().and_then(|s| s.parse().ok());
+    }
+    None
+}
+
+/// The `job-id` of the job a response describes.
+fn created_job_id(response: &IppRequestResponse) -> Option<i32> {
+    match response
+        .attributes()
+        .groups_of(DelimiterTag::JobAttributes)
+        .next()?
+        .get(IppAttribute::JOB_ID)
+        .map(IppAttribute::value)?
+    {
+        IppValue::Integer(id) => Some(*id),
+        _ => None,
+    }
+}
+
+/// `PrintJob` becomes `Print-Job`: the spelling IPP uses for the names of its
+/// operations and, lowercased, of its status codes.
+fn hyphenate(name: &str) -> String {
+    let characters: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, &c) in characters.iter().enumerate() {
+        // A capital starts a new word unless it is in the middle of an
+        // acronym, so `CupsGetPPD` keeps its `PPD` together.
+        let starts_word = i > 0
+            && c.is_ascii_uppercase()
+            && (characters[i - 1].is_lowercase()
+                || characters
+                    .get(i + 1)
+                    .is_some_and(|next| next.is_lowercase()));
+        if starts_word {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn declared_format(request: &IppRequestResponse) -> Option<String> {
@@ -1499,6 +1598,132 @@ mod tests {
         ])));
         // Truncated.
         assert!(!has_required_preamble(&[2, 0, 0, 0x0B, 0, 0, 0, 1]));
+    }
+
+    /// Where a test request comes from.
+    fn request_context() -> RequestContext {
+        RequestContext {
+            origin: std::net::Ipv4Addr::new(10, 0, 0, 1).into(),
+            host: "printer.local:631".into(),
+        }
+    }
+
+    /// Builds a request for `operation`, with the operation attributes given
+    /// as (name, value).
+    fn request_for(
+        operation: ipp::model::Operation,
+        attributes: &[(IppAttributeName, IppValue)],
+    ) -> Bytes {
+        let uri: http::Uri = "ipp://printer.local:631/ipp/print".parse().unwrap();
+        let mut request =
+            IppRequestResponse::new(IppVersion::v2_0(), operation, Some(uri)).unwrap();
+        for (name, value) in attributes {
+            request.attributes_mut().add(
+                DelimiterTag::OperationAttributes,
+                IppAttribute::new(*name, value.clone()),
+            );
+        }
+        request.to_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_handled_request_is_summarised_for_the_access_log() {
+        let (printer, _) = printer_with(vec![]);
+        let body = request_for(
+            ipp::model::Operation::ValidateJob,
+            &[
+                (
+                    IppAttributeName::JOB_NAME,
+                    IppValue::new_name_without_language("Report.pdf").unwrap(),
+                ),
+                (
+                    IppAttributeName::DOCUMENT_FORMAT,
+                    IppValue::new_mime_media_type("application/pdf").unwrap(),
+                ),
+                (
+                    IppAttributeName::REQUESTING_USER_NAME,
+                    IppValue::new_name_without_language("alice").unwrap(),
+                ),
+            ],
+        );
+
+        let summary = printer.handle(body, &request_context()).await.summary;
+        assert_eq!(summary.operation, Some(Operations::VALIDATE_JOB));
+        assert_eq!(summary.operation_name().as_deref(), Some("Validate-Job"));
+        assert_eq!(summary.status, Some(StatusCode::SuccessfulOk));
+        assert_eq!(summary.status_name().as_deref(), Some("successful-ok"));
+        assert_eq!(summary.request_id, Some(1));
+        assert_eq!(summary.job_name.as_deref(), Some("Report.pdf"));
+        assert_eq!(summary.document_format.as_deref(), Some("application/pdf"));
+        assert_eq!(summary.user.as_deref(), Some("alice"));
+        // Validate-Job creates nothing.
+        assert!(summary.job_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_summary_carries_the_id_of_a_job_the_request_created() {
+        let (printer, _) = printer_with(vec![]);
+        let body = request_for(ipp::model::Operation::CreateJob, &[]);
+
+        let summary = printer.handle(body, &request_context()).await.summary;
+        assert_eq!(summary.status, Some(StatusCode::SuccessfulOk));
+        let created = summary.job_id.expect("Create-Job answers with a job id");
+
+        // And a request about that job is summarised with the id it names.
+        let body = request_for(
+            ipp::model::Operation::GetJobAttributes,
+            &[(IppAttributeName::JOB_ID, IppValue::Integer(created))],
+        );
+        let summary = printer.handle(body, &request_context()).await.summary;
+        assert_eq!(summary.job_id, Some(created));
+        assert_eq!(
+            summary.operation_name().as_deref(),
+            Some("Get-Job-Attributes")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_refused_before_it_parses_is_still_summarised() {
+        let (printer, _) = printer_with(vec![]);
+        // IPP 3.0, which this Printer does not speak.
+        let body = Bytes::from_static(&[3, 0, 0, 0x0B, 0, 0, 0, 7]);
+
+        let summary = printer.handle(body, &request_context()).await.summary;
+        assert_eq!(
+            summary.status,
+            Some(StatusCode::ServerErrorVersionNotSupported)
+        );
+        assert_eq!(
+            summary.status_name().as_deref(),
+            Some("server-error-version-not-supported")
+        );
+        // The request-id is readable even when nothing else is.
+        assert_eq!(summary.request_id, Some(7));
+        assert!(summary.operation.is_none());
+        assert!(summary.operation_name().is_none());
+    }
+
+    #[test]
+    fn operation_and_status_names_are_spelled_the_way_ipp_spells_them() {
+        assert_eq!(hyphenate("PrintJob"), "Print-Job");
+        assert_eq!(hyphenate("GetPrinterAttributes"), "Get-Printer-Attributes");
+        // An acronym stays in one piece.
+        assert_eq!(hyphenate("CupsGetPPD"), "Cups-Get-PPD");
+        assert_eq!(hyphenate("Ok"), "Ok");
+        assert_eq!(hyphenate(""), "");
+
+        // An operation this Printer does not implement still gets a name.
+        let summary = IppSummary {
+            operation: Some(0x000C),
+            ..IppSummary::default()
+        };
+        assert_eq!(summary.operation_name().as_deref(), Some("Hold-Job"));
+        // One that is not an IPP operation at all has none.
+        let summary = IppSummary {
+            operation: Some(0x7FFF),
+            ..IppSummary::default()
+        };
+        assert!(summary.operation_name().is_none());
     }
 
     #[test]
